@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"go.etcd.io/etcd/etcdserver/api/rafthttp"
 	"go.etcd.io/etcd/etcdserver/api/snap"
 	stats "go.etcd.io/etcd/etcdserver/api/v2stats"
@@ -64,11 +65,12 @@ type raftNode struct {
 	snapshotter      *snap.Snapshotter
 	snapshotterReady chan *snap.Snapshotter // signals when snapshotter is ready
 
-	snapCount uint64
-	transport *rafthttp.Transport
-	stopc     chan struct{} // signals proposal channel closed
-	httpstopc chan struct{} // signals http server to shutdown
-	httpdonec chan struct{} // signals http server shutdown complete
+	snapCount      uint64
+	transport      *rafthttp.Transport
+	messageHandler MessageHandler
+	stopc          chan struct{} // signals proposal channel closed
+	httpstopc      chan struct{} // signals http server to shutdown
+	httpdonec      chan struct{} // signals http server shutdown complete
 }
 
 var defaultSnapshotCount uint64 = 10000
@@ -78,7 +80,7 @@ var defaultSnapshotCount uint64 = 10000
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
+func newRaftNode(id int, mm MessageManager, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
 	confChangeC <-chan raftpb.ConfChange) (<-chan *string, <-chan error, <-chan *snap.Snapshotter) {
 
 	commitC := make(chan *string)
@@ -103,6 +105,12 @@ func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 		snapshotterReady: make(chan *snap.Snapshotter, 1),
 		// rest of structure populated after WAL replay
 	}
+	if mm != nil {
+		rc.messageHandler = mm.Register(100)
+	} else {
+		rc.messageHandler = nil
+	}
+
 	go rc.startRaft()
 	return commitC, errorC, rc.snapshotterReady
 }
@@ -159,17 +167,19 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 			var cc raftpb.ConfChange
 			cc.Unmarshal(ents[i].Data)
 			rc.confState = *rc.node.ApplyConfChange(cc)
-			switch cc.Type {
-			case raftpb.ConfChangeAddNode:
-				if len(cc.Context) > 0 {
-					rc.transport.AddPeer(types.ID(cc.NodeID), []string{string(cc.Context)})
+			if rc.messageHandler == nil {
+				switch cc.Type {
+				case raftpb.ConfChangeAddNode:
+					if len(cc.Context) > 0 {
+						rc.transport.AddPeer(types.ID(cc.NodeID), []string{string(cc.Context)})
+					}
+				case raftpb.ConfChangeRemoveNode:
+					if cc.NodeID == uint64(rc.id) {
+						log.Println("I've been removed from the cluster! Shutting down.")
+						return false
+					}
+					rc.transport.RemovePeer(types.ID(cc.NodeID))
 				}
-			case raftpb.ConfChangeRemoveNode:
-				if cc.NodeID == uint64(rc.id) {
-					log.Println("I've been removed from the cluster! Shutting down.")
-					return false
-				}
-				rc.transport.RemovePeer(types.ID(cc.NodeID))
 			}
 		}
 
@@ -293,24 +303,35 @@ func (rc *raftNode) startRaft() {
 		rc.node = raft.StartNode(c, startPeers)
 	}
 
-	rc.transport = &rafthttp.Transport{
-		Logger:      zap.NewExample(),
-		ID:          types.ID(rc.id),
-		ClusterID:   0x1000,
-		Raft:        rc,
-		ServerStats: stats.NewServerStats("", ""),
-		LeaderStats: stats.NewLeaderStats(strconv.Itoa(rc.id)),
-		ErrorC:      make(chan error),
-	}
-
-	rc.transport.Start()
-	for i := range rc.peers {
-		if i+1 != rc.id {
-			rc.transport.AddPeer(types.ID(i+1), []string{rc.peers[i]})
+	if rc.messageHandler == nil {
+		rc.transport = &rafthttp.Transport{
+			Logger:      zap.NewExample(),
+			ID:          types.ID(rc.id),
+			ClusterID:   0x1000,
+			Raft:        rc,
+			ServerStats: stats.NewServerStats("", ""),
+			LeaderStats: stats.NewLeaderStats(strconv.Itoa(rc.id)),
+			ErrorC:      make(chan error),
 		}
+
+		rc.transport.Start()
+		for i := range rc.peers {
+			if i+1 != rc.id {
+				rc.transport.AddPeer(types.ID(i+1), []string{rc.peers[i]})
+			}
+		}
+		go rc.serveRaft()
+	} else {
+		go func(rc *raftNode) {
+			for {
+				message, _ := rc.messageHandler.Recv()
+				var raftMsg raftpb.Message
+				proto.Unmarshal(message.Content(), &raftMsg)
+				rc.node.Step(context.TODO(), raftMsg)
+			}
+		}(rc)
 	}
 
-	go rc.serveRaft()
 	go rc.serveChannels()
 }
 
@@ -323,7 +344,9 @@ func (rc *raftNode) stop() {
 }
 
 func (rc *raftNode) stopHTTP() {
-	rc.transport.Stop()
+	if rc.messageHandler == nil {
+		rc.transport.Stop()
+	}
 	close(rc.httpstopc)
 	<-rc.httpdonec
 }
@@ -435,7 +458,15 @@ func (rc *raftNode) serveChannels() {
 				rc.publishSnapshot(rd.Snapshot)
 			}
 			rc.raftStorage.Append(rd.Entries)
-			rc.transport.Send(rd.Messages)
+			if rc.messageHandler == nil {
+				rc.transport.Send(rd.Messages)
+			} else {
+				for _, message := range rd.Messages {
+					msg, _ := proto.Marshal(&message)
+					rc.messageHandler.Send(NewMessage(message.To, msg))
+				}
+			}
+
 			if ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries)); !ok {
 				rc.stop()
 				return
@@ -443,9 +474,9 @@ func (rc *raftNode) serveChannels() {
 			rc.maybeTriggerSnapshot()
 			rc.node.Advance()
 
-		case err := <-rc.transport.ErrorC:
-			rc.writeError(err)
-			return
+		//case err := <-rc.transport.ErrorC:
+		//	rc.writeError(err)
+		//	return
 
 		case <-rc.stopc:
 			rc.stop()
