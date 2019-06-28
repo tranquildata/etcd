@@ -325,6 +325,9 @@ func (rc *raftNode) startRaft() {
 		go func(rc *raftNode) {
 			for {
 				message, _ := rc.messageHandler.Recv()
+				if message == nil {
+					return
+				}
 				var raftMsg raftpb.Message
 				proto.Unmarshal(message.Content(), &raftMsg)
 				rc.node.Step(context.TODO(), raftMsg)
@@ -346,9 +349,11 @@ func (rc *raftNode) stop() {
 func (rc *raftNode) stopHTTP() {
 	if rc.messageHandler == nil {
 		rc.transport.Stop()
+		close(rc.httpstopc)
+		<-rc.httpdonec
+	} else {
+		rc.messageHandler.Stop()
 	}
-	close(rc.httpstopc)
-	<-rc.httpdonec
 }
 
 func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
@@ -439,6 +444,7 @@ func (rc *raftNode) serveChannels() {
 				}
 			}
 		}
+
 		// client closed channel; shutdown raft if not already
 		close(rc.stopc)
 	}()
@@ -474,9 +480,11 @@ func (rc *raftNode) serveChannels() {
 			rc.maybeTriggerSnapshot()
 			rc.node.Advance()
 
-		//case err := <-rc.transport.ErrorC:
-		//	rc.writeError(err)
-		//	return
+		/*
+			case err := <-rc.transport.ErrorC:
+				rc.writeError(err)
+				return
+		*/
 
 		case <-rc.stopc:
 			rc.stop()

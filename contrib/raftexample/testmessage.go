@@ -5,6 +5,7 @@
 package main
 
 import (
+	//	"fmt"
 	"sync"
 )
 
@@ -52,6 +53,9 @@ func (tmm *testMessageManager) managerListener() {
 			if handlers, exists := tmm.channels[m.channel]; exists {
 				for _, h := range handlers {
 					//fmt.Printf("Receiving from %d to %d: %s\n", m.message.From(), m.message.To()[0], string(m.message.Content()))
+					if h.recv == nil {
+						return
+					}
 					h.recv <- m.message
 				}
 			}
@@ -76,6 +80,9 @@ func (tmm *testMessageManager) Register(channelID uint64) MessageHandler {
 func (tmm *testMessageManager) handlerListener(channelID uint64, channel chan Message) {
 	for {
 		message := <-channel
+		if message == nil {
+			return
+		}
 		for _, target := range message.To() {
 			//fmt.Printf("Sending from %d to %d: %s\n", tmm.nodeID, target, string(message.Content()))
 			if remote, exists := fabric.managers.Load(target); exists {
@@ -93,10 +100,22 @@ func (tmm *testMessageManager) fabricMessage(channelID uint64, m Message) *fabri
 /* Implement MessageHandler */
 
 func (tmh *testMessageHandler) Send(message Message) error {
-	tmh.send <- message
+	if tmh.send != nil {
+		tmh.send <- message
+	}
 	return nil
 }
 
 func (tmh *testMessageHandler) Recv() (Message, error) {
+	if tmh.recv == nil {
+		return nil, nil
+	}
 	return <-tmh.recv, nil
+}
+
+func (tmh *testMessageHandler) Stop() {
+	close(tmh.send)
+	tmh.send = nil
+	close(tmh.recv)
+	tmh.recv = nil
 }

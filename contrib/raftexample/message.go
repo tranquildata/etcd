@@ -13,6 +13,7 @@ type MessageManager interface {
 type MessageHandler interface {
 	Send(message Message) error
 	Recv() (Message, error)
+	Stop()
 }
 
 // Message is the interface for structures on channels.
